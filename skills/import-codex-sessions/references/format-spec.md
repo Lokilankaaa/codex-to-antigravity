@@ -10,13 +10,16 @@ This reference documents the exact schema mapping implemented by `codex2agy.py` 
 | :--- | :--- | :--- |
 | `state_<N>.sqlite` | Metadata & Project index (highest `<N>` wins, e.g. `state_5.sqlite`) | `threads` (`id`, `cwd`, `name`, `title`, `archived`, `project_id`, `created_at`, `updated_at`, `agent_role`, `source`, `attached_thread_parent_id`), `projects` (`id`, `name`, `position`), `project_roots` (`project_id`, `position`, `path`), `thread_spawn_edges` (`parent_thread_id`, `child_thread_id`) |
 | `thread_history_<N>.sqlite` | Migrated historical turns & items (Codex Desktop 26.x+) | `thread_turns`, `thread_items` (`thread_id`, `rollout_ordinal`, `created_at_ms`, `item_type`, `item_json`) |
-| `sessions/YYYY/MM/DD/rollout-*.jsonl` & `archived_sessions/*.jsonl` | Active and archived JSONL rollouts | `session_meta`, `turn_context`, `response_item` (`message`, `reasoning`, `function_call`, `local_shell_call`), `event_msg` |
+| `sessions/YYYY/MM/DD/rollout-*.jsonl` & `archived_sessions/*.jsonl` | Active and archived JSONL rollouts (including `<root_uuid>_<segment_uuid>` continuation segments) | `session_meta` (`id` / `session_id`), `turn_context`, `response_item` (`message`, `reasoning`, `function_call`, `local_shell_call`), `event_msg` |
 | `session_index.jsonl` | Lightweight thread title index | `id`, `thread_name`, `updated_at` |
+
+### Segmented Rollout Merging
+Long Codex Desktop conversations rotate into continuation files named `rollout-<timestamp>-<root_uuid>_<segment_uuid>.jsonl[.zst]` with monotonically increasing `rollout_ordinal`s, and `thread_history_<N>.sqlite` indexes items per `<segment_uuid>`. Both `codex2agy.py` and `codex2agy.ps1` map `<segment_uuid> -> <root_uuid>` transitively and merge all segments ordered by `(rollout_ordinal, created_at_ms)` back into the canonical `<root_uuid>` thread.
 
 ### Project Resolution Order
 1. Explicit override in `rename-config.json` (`thread_projects`).
 2. `threads.project_id` in `state_<N>.sqlite` (when non-null).
-3. Normalized `threads.cwd` (preferring `state_<N>.sqlite`'s latest `cwd` over initial rollout `.jsonl` `cwd`) matched against `project_roots` with **`position = 0` (primary root)** first, then secondary roots (`position > 0`).
+3. Normalized `threads.cwd` (preferring `state_<N>.sqlite`'s latest `cwd` over initial rollout `.jsonl` `cwd`) matched against `project_roots` with **`position = 0` (primary root, longest-prefix match)** first, then secondary roots (`position > 0`).
 
 ---
 

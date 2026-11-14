@@ -1,15 +1,15 @@
 {
-  "name": "codex-session-importer",
-  "displayName": "Codex Session Importer",
-  "version": "1.0.0",
+  "name": "codex-to-antigravity",
+  "displayName": "Codex to Antigravity",
+  "version": "1.1.0",
   "author": "Lokilankaaa",
-  "homepage": "https://github.com/Lokilankaaa/codex-session-importer",
-  "repository": "https://github.com/Lokilankaaa/codex-session-importer",
-  "description": "Import local OpenAI Codex sessions and project groupings (~/.codex) into Google Antigravity native Projects and Conversations on macOS, Windows, and Linux.",
+  "homepage": "https://github.com/Lokilankaaa/codex-to-antigravity",
+  "repository": "https://github.com/Lokilankaaa/codex-to-antigravity",
+  "description": "Migrate local OpenAI Codex sessions and project groupings (~/.codex) into Google Antigravity native Projects and Conversations on macOS, Windows, and Linux.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
-    "Import my local Codex sessions and projects into Antigravity",
+    "Migrate my local Codex sessions and projects into Antigravity",
     "Preview my ~/.codex threads and clean up their titles before importing",
-    "导入我本机的 Codex 会话和项目分组"
+    "迁移我本机的 Codex 会话和项目分组到 Antigravity"
   ]
 }

@@ -710,10 +710,16 @@ namespace CodexToAgyV2 {
             return sb.ToString().Trim();
         }
 
-        public static List<RawTurnEvent> ParseJsonlEvents(string path, JavaScriptSerializer ser, out string foundId, out string foundCwd, out string agentRole, out string sourceKind) {
-            foundId = null; foundCwd = null; agentRole = null; sourceKind = null;
-            var mUuid = Regex.Match(Path.GetFileNameWithoutExtension(path), @"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$");
-            if (mUuid.Success) foundId = mUuid.Groups[1].Value.ToLowerInvariant();
+        public static List<RawTurnEvent> ParseJsonlEvents(string path, JavaScriptSerializer ser, out string foundId, out string foundCwd, out string agentRole, out string sourceKind, out long firstOrdinal) {
+            foundId = null; foundCwd = null; agentRole = null; sourceKind = null; firstOrdinal = 0;
+            bool hasFirstOrdinal = false;
+            var mPair = Regex.Match(Path.GetFileName(path), @"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})");
+            if (mPair.Success) {
+                foundId = mPair.Groups[1].Value.ToLowerInvariant();
+            } else {
+                var mUuid = Regex.Match(Path.GetFileNameWithoutExtension(path), @"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$");
+                if (mUuid.Success) foundId = mUuid.Groups[1].Value.ToLowerInvariant();
+            }
 
             var respEvents = new List<RawTurnEvent>();
             var fallbackEvents = new List<RawTurnEvent>();
@@ -729,12 +735,21 @@ namespace CodexToAgyV2 {
                     try { obj = ser.DeserializeObject(line) as IDictionary; } catch { continue; }
                     if (obj == null) continue;
 
+                    if (!hasFirstOrdinal && obj.Contains("ordinal") && obj["ordinal"] != null) {
+                        long parsedOrd;
+                        if (long.TryParse(Convert.ToString(obj["ordinal"]), out parsedOrd)) {
+                            firstOrdinal = parsedOrd;
+                            hasFirstOrdinal = true;
+                        }
+                    }
+
                     lastTs = ParseTimestamp(GetStr(obj, "timestamp"), lastTs);
                     string topType = GetStr(obj, "type");
                     IDictionary payload = obj.Contains("payload") ? (obj["payload"] as IDictionary) : null;
 
                     if (topType == "session_meta" && payload != null) {
                         string pid = GetStr(payload, "id");
+                        if (string.IsNullOrEmpty(pid)) pid = GetStr(payload, "session_id");
                         if (!string.IsNullOrEmpty(pid)) foundId = pid.ToLowerInvariant();
                         if (string.IsNullOrEmpty(foundCwd)) foundCwd = GetStr(payload, "cwd");
                         if (string.IsNullOrEmpty(agentRole)) agentRole = GetStr(payload, "agent_role");
@@ -1083,7 +1098,9 @@ namespace CodexToAgyV2 {
                     }
 
                     string pid = string.IsNullOrEmpty(conv.AgyProjectId) ? "outside-of-project" : conv.AgyProjectId;
-                    string wsUris = conv.WorkspaceUri ?? "";
+                    string wsUris = string.IsNullOrEmpty(conv.WorkspaceUri)
+                        ? ""
+                        : ("[\"" + conv.WorkspaceUri.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"]");
 
                     byte[] rawSum = AgyProtoBuilder.BuildCascadeRunSummary(
                         conv.Title, conv.Steps.Count, conv.CreatedAt, conv.UpdatedAt,
@@ -1219,8 +1236,15 @@ if (Test-Path $existingCfgProjDir) {
                 $pr = $po["projectResources"]
                 if ($pr.ContainsKey("resources") -and $pr["resources"]) {
                     foreach ($resItem in $pr["resources"]) {
-                        if ($resItem -and $resItem.ContainsKey("gitFolder") -and $resItem["gitFolder"] -and $resItem["gitFolder"].ContainsKey("folderUri")) {
-                            $furi = ([string]$resItem["gitFolder"]["folderUri"]).TrimEnd('/')
+                        if (-not $resItem) { continue }
+                        $rawFuri = $null
+                        if ($resItem.ContainsKey("gitFolder") -and $resItem["gitFolder"] -and $resItem["gitFolder"].ContainsKey("folderUri")) {
+                            $rawFuri = [string]$resItem["gitFolder"]["folderUri"]
+                        } elseif ($resItem.ContainsKey("folderUri") -and $resItem["folderUri"]) {
+                            $rawFuri = [string]$resItem["folderUri"]
+                        }
+                        if ($rawFuri) {
+                            $furi = $rawFuri.TrimEnd('/')
                             if ($furi) { $existingUriToAgyProjId[$furi.ToLowerInvariant()] = [string]$po["id"] }
                         }
                     }
@@ -1247,8 +1271,8 @@ $skippedEmpty = 0
 
 if (-not [string]::IsNullOrWhiteSpace($InputJsonl)) {
     $fullJsonl = (Resolve-Path $InputJsonl).Path
-    $fid = $null; $fcwd = $null; $frole = $null; $fsrc = $null
-    $evts = [CodexToAgyV2.SessionConverter]::ParseJsonlEvents($fullJsonl, $ser, [ref]$fid, [ref]$fcwd, [ref]$frole, [ref]$fsrc)
+    $fid = $null; $fcwd = $null; $frole = $null; $fsrc = $null; $ford = [long]0
+    $evts = [CodexToAgyV2.SessionConverter]::ParseJsonlEvents($fullJsonl, $ser, [ref]$fid, [ref]$fcwd, [ref]$frole, [ref]$fsrc, [ref]$ford)
     if ([string]::IsNullOrEmpty($fid)) { $fid = [Guid]::NewGuid().ToString() }
     $ovrTitle = if ($customThreadTitles.ContainsKey($fid)) { $customThreadTitles[$fid] } else { "" }
     $conv = [CodexToAgyV2.SessionConverter]::BuildConvertedSession(
@@ -1360,17 +1384,17 @@ if (-not [string]::IsNullOrWhiteSpace($InputJsonl)) {
         if ([string]::IsNullOrEmpty($normCwd)) { return $null }
         $cl = $normCwd.ToLowerInvariant()
 
-        # 1. Exact or subdirectory match on primary root (position == 0)
+        # 1. Exact or longest-prefix subdirectory match on primary root (position == 0)
         if ($primaryRootMap.ContainsKey($cl)) {
             return $codexProjects[$primaryRootMap[$cl]]
         }
-        foreach ($rk in $primaryRootMap.Keys) {
+        foreach ($rk in ($primaryRootMap.Keys | Sort-Object Length -Descending)) {
             if ($cl.StartsWith($rk + "\")) {
                 return $codexProjects[$primaryRootMap[$rk]]
             }
         }
-        # 2. Fallback to secondary roots (position > 0)
-        foreach ($sr in $secondaryRootList) {
+        # 2. Fallback to secondary roots (position > 0, longest prefix within same position)
+        foreach ($sr in ($secondaryRootList | Sort-Object @{Expression={$_.Position}; Ascending=$true}, @{Expression={$_.PathLower.Length}; Descending=$true})) {
             if ($cl -eq $sr.PathLower -or $cl.StartsWith($sr.PathLower + "\")) {
                 return $codexProjects[$sr.CodexProjectId]
             }
@@ -1443,52 +1467,117 @@ if (-not [string]::IsNullOrWhiteSpace($InputJsonl)) {
 
     $byId = @{}
 
-    # A. Scan .jsonl files in sessions & archived_sessions
+    # Map Codex segmented rollout filenames (<root_uuid>_<segment_uuid>.jsonl[.zst]) back to root_uuid
+    $segmentToRoot = @{}
+    $rxPair = [Regex]"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+    foreach ($sub in @("sessions", "archived_sessions")) {
+        $p = Join-Path $CodexDir $sub
+        if (Test-Path $p) {
+            foreach ($rf in (Get-ChildItem -Path $p -Filter "*_*" -Recurse -File -ErrorAction SilentlyContinue)) {
+                $mp = $rxPair.Match($rf.Name)
+                if ($mp.Success) {
+                    $rootU = $mp.Groups[1].Value.ToLowerInvariant()
+                    $segU  = $mp.Groups[2].Value.ToLowerInvariant()
+                    if ($segU -ne $rootU) { $segmentToRoot[$segU] = $rootU }
+                }
+            }
+        }
+    }
+    foreach ($segKey in @($segmentToRoot.Keys)) {
+        $cur = $segmentToRoot[$segKey]
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+        [void]$seen.Add($segKey)
+        while ($segmentToRoot.ContainsKey($cur) -and -not $seen.Contains($cur)) {
+            [void]$seen.Add($cur)
+            $cur = $segmentToRoot[$cur]
+        }
+        $segmentToRoot[$segKey] = $cur
+    }
+
+    # A. Scan .jsonl files in sessions & archived_sessions, grouping multi-segment rollouts
     $jsonlFiles = @()
     foreach ($sub in @("sessions", "archived_sessions")) {
         $p = Join-Path $CodexDir $sub
         if (Test-Path $p) { $jsonlFiles += Get-ChildItem -Path $p -Filter "*.jsonl" -Recurse -File -ErrorAction SilentlyContinue }
     }
+    $jsonlSegments = @{}
     foreach ($f in $jsonlFiles) {
-        $fid = $null; $fcwd = $null; $frole = $null; $fsrc = $null
-        $evts = [CodexToAgyV2.SessionConverter]::ParseJsonlEvents($f.FullName, $ser, [ref]$fid, [ref]$fcwd, [ref]$frole, [ref]$fsrc)
-        if ([string]::IsNullOrEmpty($fid)) { $fid = [System.IO.Path]::GetFileNameWithoutExtension($f.Name).ToLowerInvariant() }
+        $fid = $null; $fcwd = $null; $frole = $null; $fsrc = $null; $ford = [long]0
+        $evts = [CodexToAgyV2.SessionConverter]::ParseJsonlEvents($f.FullName, $ser, [ref]$fid, [ref]$fcwd, [ref]$frole, [ref]$fsrc, [ref]$ford)
+        $rawFid = if ([string]::IsNullOrEmpty($fid)) { [System.IO.Path]::GetFileNameWithoutExtension($f.Name).ToLowerInvariant() } else { $fid }
+        $rootFid = if ($segmentToRoot.ContainsKey($rawFid)) { $segmentToRoot[$rawFid] } else { $rawFid }
+        if (-not $jsonlSegments.ContainsKey($rootFid)) { $jsonlSegments[$rootFid] = @() }
+        $jsonlSegments[$rootFid] += [PSCustomObject]@{
+            FirstOrdinal = $ford
+            FileName     = $f.Name
+            Events       = $evts
+            Cwd          = $fcwd
+            Role         = $frole
+            Source       = $fsrc
+            IsArch       = ($f.FullName -imatch "archived_sessions")
+        }
+    }
+
+    foreach ($fid in $jsonlSegments.Keys) {
+        $segs = $jsonlSegments[$fid] | Sort-Object FirstOrdinal, FileName
+        $mergedEvts = New-Object 'System.Collections.Generic.List[CodexToAgyV2.RawTurnEvent]'
+        $fcwdMerged = $null; $froleMerged = $null; $fsrcMerged = $null; $archMerged = $true
+        foreach ($sg in $segs) {
+            foreach ($e in $sg.Events) { $mergedEvts.Add($e) }
+            if (-not [string]::IsNullOrEmpty($sg.Cwd)) { $fcwdMerged = $sg.Cwd }
+            if ([string]::IsNullOrEmpty($froleMerged) -and $sg.Role) { $froleMerged = $sg.Role }
+            if ([string]::IsNullOrEmpty($fsrcMerged) -and $sg.Source) { $fsrcMerged = $sg.Source }
+            if (-not $sg.IsArch) { $archMerged = $false }
+        }
+
         $sm = if ($sqliteMeta.ContainsKey($fid)) { $sqliteMeta[$fid] } else { $null }
-        $skip = Test-SkipCodexThread $fid $sm $frole $fsrc
+        $skip = Test-SkipCodexThread $fid $sm $froleMerged $fsrcMerged
         if ($skip -eq "guardian") { $skippedGuardian++; continue }
         if ($skip -eq "subagent") { $skippedSubagent++; continue }
         if ($skip -ne $null) { continue }
 
-        $m = Resolve-ThreadMeta $fid $fcwd ($f.FullName -imatch "archived_sessions")
+        $m = Resolve-ThreadMeta $fid $fcwdMerged $archMerged
         $agyProjId = if ($m.Project) { $m.Project.AgyProjectId } else { "outside-of-project" }
         $pName = if ($m.Project) { $m.Project.Name } else { "" }
         $pUri = if ($m.Project) { $m.Project.FolderUri } else { "" }
-        $conv = [CodexToAgyV2.SessionConverter]::BuildConvertedSession($fid, $m.Title, $TitlePrefix, $m.Cwd, $m.Archived, $agyProjId, $pName, $pUri, $m.CreatedAt, $m.UpdatedAt, $evts)
+        $conv = [CodexToAgyV2.SessionConverter]::BuildConvertedSession($fid, $m.Title, $TitlePrefix, $m.Cwd, $m.Archived, $agyProjId, $pName, $pUri, $m.CreatedAt, $m.UpdatedAt, $mergedEvts)
         if ($conv -eq $null) { $skippedEmpty++; continue }
-        if (-not $byId.ContainsKey($fid) -or $conv.Steps.Count -gt $byId[$fid].Steps.Count) {
-            $byId[$fid] = $conv
-        }
+        $byId[$fid] = $conv
     }
 
-    # B. Scan thread_history_1.sqlite for migrated threads
+    # B. Scan thread_history_*.sqlite (merging segmented rollout IDs)
     $histDbPath = Find-LatestVersionedSqlite $CodexDir "thread_history"
     if ($histDbPath -and (Test-Path -LiteralPath $histDbPath)) {
         $hdb = New-Object CodexToAgyV2.WinSqlite($histDbPath, $true)
         try {
-            $candIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-            foreach ($k in $sqliteMeta.Keys) { [void]$candIds.Add($k) }
+            $rootToRawIds = @{}
+            foreach ($k in $sqliteMeta.Keys) {
+                $rawVal = if ($sqliteMeta[$k].ContainsKey("id") -and $sqliteMeta[$k]["id"]) { [string]$sqliteMeta[$k]["id"] } else { $k }
+                $rTid = if ($segmentToRoot.ContainsKey($k)) { $segmentToRoot[$k] } else { $k }
+                if (-not $rootToRawIds.ContainsKey($rTid)) { $rootToRawIds[$rTid] = New-Object 'System.Collections.Generic.List[string]' }
+                if (-not $rootToRawIds[$rTid].Contains($rawVal)) { $rootToRawIds[$rTid].Add($rawVal) }
+            }
             foreach ($tr in $hdb.Query("SELECT DISTINCT thread_id FROM thread_turns", $false)) {
-                if ($tr.ContainsKey("thread_id") -and $tr["thread_id"]) { [void]$candIds.Add(([string]$tr["thread_id"]).ToLowerInvariant()) }
+                if ($tr.ContainsKey("thread_id") -and $tr["thread_id"]) {
+                    $rawVal = [string]$tr["thread_id"]
+                    $lowVal = $rawVal.ToLowerInvariant()
+                    $rTid = if ($segmentToRoot.ContainsKey($lowVal)) { $segmentToRoot[$lowVal] } else { $lowVal }
+                    if (-not $rootToRawIds.ContainsKey($rTid)) { $rootToRawIds[$rTid] = New-Object 'System.Collections.Generic.List[string]' }
+                    if (-not $rootToRawIds[$rTid].Contains($rawVal)) { $rootToRawIds[$rTid].Add($rawVal) }
+                }
             }
 
             $targets = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($cid in $candIds) {
-                if ($byId.ContainsKey($cid)) { continue }
+            foreach ($cid in $rootToRawIds.Keys) {
                 $sm = if ($sqliteMeta.ContainsKey($cid)) { $sqliteMeta[$cid] } else { $null }
                 $skip = Test-SkipCodexThread $cid $sm $null $null
-                if ($skip -eq "guardian") { $skippedGuardian++; continue }
-                if ($skip -eq "subagent") { $skippedSubagent++; continue }
-                if ($skip -ne $null) { continue }
+                if (-not $byId.ContainsKey($cid)) {
+                    if ($skip -eq "guardian") { $skippedGuardian++; continue }
+                    if ($skip -eq "subagent") { $skippedSubagent++; continue }
+                    if ($skip -ne $null) { continue }
+                } else {
+                    if ($skip -ne $null) { continue }
+                }
                 $targets.Add($cid)
             }
 
@@ -1496,29 +1585,52 @@ if (-not [string]::IsNullOrWhiteSpace($InputJsonl)) {
             for ($bi = 0; $bi -lt $targets.Count; $bi += $batchSize) {
                 $endIdx = [Math]::Min($bi + $batchSize - 1, $targets.Count - 1)
                 $quoted = @()
-                for ($j = $bi; $j -le $endIdx; $j++) { $quoted += "'" + ($targets[$j] -replace "'", "''") + "'" }
-                $sql = "SELECT thread_id, rollout_ordinal, created_at_ms, item_type, item_json FROM thread_items WHERE thread_id IN (" + ($quoted -join ",") + ") ORDER BY thread_id, rollout_ordinal ASC"
+                $rawToRoot = @{}
+                for ($j = $bi; $j -le $endIdx; $j++) {
+                    $rTid = $targets[$j]
+                    foreach ($rv in $rootToRawIds[$rTid]) {
+                        $quoted += "'" + ($rv -replace "'", "''") + "'"
+                        $rawToRoot[$rv.ToLowerInvariant()] = $rTid
+                    }
+                }
+                $sql = "SELECT thread_id, rollout_ordinal, created_at_ms, item_type, item_json FROM thread_items WHERE thread_id IN (" + ($quoted -join ",") + ")"
                 $rows = $hdb.Query($sql, $false)
 
-                $grouped = @{}
+                $groupedRaw = @{}
                 foreach ($r in $rows) {
-                    $tid = ([string]$r["thread_id"]).ToLowerInvariant()
-                    if (-not $grouped.ContainsKey($tid)) { $grouped[$tid] = New-Object 'System.Collections.Generic.List[CodexToAgyV2.RawTurnEvent]' }
+                    $lowTid = ([string]$r["thread_id"]).ToLowerInvariant()
+                    $rTid = if ($rawToRoot.ContainsKey($lowTid)) { $rawToRoot[$lowTid] } else { $lowTid }
+                    $ordVal = if ($r.ContainsKey("rollout_ordinal") -and $r["rollout_ordinal"] -ne $null) { [Convert]::ToInt64($r["rollout_ordinal"]) } else { [long]0 }
+                    $cmsVal = if ($r.ContainsKey("created_at_ms") -and $r["created_at_ms"] -ne $null) { [Convert]::ToInt64($r["created_at_ms"]) } else { [long]0 }
                     $ts = [CodexToAgyV2.SessionConverter]::ParseTimestamp([string]$r["created_at_ms"], [DateTimeOffset]::UtcNow)
                     $ev = [CodexToAgyV2.SessionConverter]::ParseSqliteItem([string]$r["item_type"], [string]$r["item_json"], $ts, $ser)
-                    if ($ev -ne $null) { $grouped[$tid].Add($ev) }
+                    if ($ev -ne $null) {
+                        if (-not $groupedRaw.ContainsKey($rTid)) { $groupedRaw[$rTid] = @() }
+                        $groupedRaw[$rTid] += [PSCustomObject]@{ Ord = $ordVal; Cms = $cmsVal; Ev = $ev }
+                    }
                 }
 
                 for ($j = $bi; $j -le $endIdx; $j++) {
                     $tid = $targets[$j]
-                    if (-not $grouped.ContainsKey($tid)) { $skippedEmpty++; continue }
+                    if (-not $groupedRaw.ContainsKey($tid)) {
+                        if (-not $byId.ContainsKey($tid)) { $skippedEmpty++ }
+                        continue
+                    }
+                    $sortedEvts = New-Object 'System.Collections.Generic.List[CodexToAgyV2.RawTurnEvent]'
+                    foreach ($it in ($groupedRaw[$tid] | Sort-Object Ord, Cms)) { $sortedEvts.Add($it.Ev) }
+
                     $m = Resolve-ThreadMeta $tid "" $false
                     $agyProjId = if ($m.Project) { $m.Project.AgyProjectId } else { "outside-of-project" }
                     $pName = if ($m.Project) { $m.Project.Name } else { "" }
                     $pUri = if ($m.Project) { $m.Project.FolderUri } else { "" }
-                    $conv = [CodexToAgyV2.SessionConverter]::BuildConvertedSession($tid, $m.Title, $TitlePrefix, $m.Cwd, $m.Archived, $agyProjId, $pName, $pUri, $m.CreatedAt, $m.UpdatedAt, $grouped[$tid])
-                    if ($conv -eq $null) { $skippedEmpty++; continue }
-                    $byId[$tid] = $conv
+                    $conv = [CodexToAgyV2.SessionConverter]::BuildConvertedSession($tid, $m.Title, $TitlePrefix, $m.Cwd, $m.Archived, $agyProjId, $pName, $pUri, $m.CreatedAt, $m.UpdatedAt, $sortedEvts)
+                    if ($conv -eq $null) {
+                        if (-not $byId.ContainsKey($tid)) { $skippedEmpty++ }
+                        continue
+                    }
+                    if (-not $byId.ContainsKey($tid) -or $conv.Steps.Count -gt $byId[$tid].Steps.Count) {
+                        $byId[$tid] = $conv
+                    }
                 }
             }
         } finally { $hdb.Dispose() }
@@ -1633,6 +1745,17 @@ if ($Install) {
 
     foreach ($pf in $stagedProjectFiles) {
         $dstProj = Join-Path $targetProjectsDir ([System.IO.Path]::GetFileName($pf))
+        if (Test-Path -LiteralPath $dstProj) {
+            $pfStem = [System.IO.Path]::GetFileNameWithoutExtension($pf)
+            $explicitRename = $false
+            foreach ($cpid in $codexProjects.Keys) {
+                if ($codexProjects[$cpid].AgyProjectId -ieq $pfStem -and $customProjectNames.ContainsKey($cpid)) {
+                    $explicitRename = $true
+                    break
+                }
+            }
+            if (-not $explicitRename) { continue }
+        }
         Copy-Item -Path $pf -Destination $dstProj -Force
     }
 

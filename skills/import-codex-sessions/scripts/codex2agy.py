@@ -41,6 +41,10 @@ RX_INLINE_SYS_TAGS = re.compile(
     re.IGNORECASE,
 )
 RX_WIN_DRIVE = re.compile(r"^[A-Za-z]:([\\/]|$)")
+RX_UUID_PAIR = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})_"
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
 RX_UUID_TAIL = re.compile(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
 
 
@@ -527,15 +531,22 @@ def extract_content_parts(content_obj: Any, is_user: bool) -> str:
     return "\n\n".join(parts).strip()
 
 
-def parse_jsonl_events(path: Path) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[str], Optional[str], Optional[str]]:
+def parse_jsonl_events(
+    path: Path,
+) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[str], Optional[str], Optional[str], int]:
     found_id: Optional[str] = None
     found_cwd: Optional[str] = None
     agent_role: Optional[str] = None
     source_kind: Optional[str] = None
+    first_ordinal: Optional[int] = None
 
-    m_uuid = RX_UUID_TAIL.search(path.stem)
-    if m_uuid:
-        found_id = m_uuid.group(1).lower()
+    m_pair = RX_UUID_PAIR.search(path.name)
+    if m_pair:
+        found_id = m_pair.group(1).lower()
+    else:
+        m_uuid = RX_UUID_TAIL.search(path.stem)
+        if m_uuid:
+            found_id = m_uuid.group(1).lower()
 
     resp_events: List[Dict[str, Any]] = []
     fallback_events: List[Dict[str, Any]] = []
@@ -554,12 +565,15 @@ def parse_jsonl_events(path: Path) -> Tuple[List[Dict[str, Any]], Optional[str],
             if not isinstance(obj, dict):
                 continue
 
+            if first_ordinal is None and isinstance(obj.get("ordinal"), int):
+                first_ordinal = int(obj["ordinal"])
+
             last_ts = parse_timestamp(obj.get("timestamp"), last_ts)
             top_type = obj.get("type")
             payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else None
 
             if top_type == "session_meta" and payload:
-                pid = payload.get("id")
+                pid = payload.get("id") or payload.get("session_id")
                 if pid:
                     found_id = str(pid).lower()
                 if not found_cwd and payload.get("cwd"):
@@ -612,7 +626,14 @@ def parse_jsonl_events(path: Path) -> Tuple[List[Dict[str, Any]], Optional[str],
                         has_resp_msgs = True
                         resp_events.append({"kind": role, "text": txt, "ts": last_ts})
 
-    return (resp_events if has_resp_msgs else fallback_events), found_id, found_cwd, agent_role, source_kind
+    return (
+        (resp_events if has_resp_msgs else fallback_events),
+        found_id,
+        found_cwd,
+        agent_role,
+        source_kind,
+        first_ordinal if first_ordinal is not None else 0,
+    )
 
 
 def parse_sqlite_item(item_type_col: Optional[str], item_json: Optional[str], ts: datetime) -> Optional[Dict[str, Any]]:
@@ -924,7 +945,7 @@ def upsert_summaries_db(summaries_db_path: Path, sessions: List[Dict[str, Any]])
                         break
 
                 pid = conv["agy_project_id"] or "outside-of-project"
-                ws_uris = conv["workspace_uri"] or ""
+                ws_uris = json.dumps([conv["workspace_uri"]], ensure_ascii=False) if conv["workspace_uri"] else ""
                 raw_sum = build_cascade_run_summary(
                     conv["title"],
                     len(conv["steps"]),
@@ -1097,16 +1118,22 @@ def main() -> int:
 
     # Reuse existing project UUIDs in ~/.gemini/config/projects to prevent duplicate sidebar entries
     existing_uri_to_proj_id: Dict[str, str] = {}
+    existing_proj_docs: Dict[str, Dict[str, Any]] = {}
     existing_proj_dir = cfg_dir / "projects"
     if existing_proj_dir.is_dir():
         for pf in existing_proj_dir.glob("*.json"):
             try:
                 po = json.loads(pf.read_text(encoding="utf-8"))
                 pid = po.get("id")
+                if pid:
+                    existing_proj_docs[str(pid)] = po
                 resources = (po.get("projectResources") or {}).get("resources") or []
                 if pid and isinstance(resources, list):
                     for r_item in resources:
-                        furi = ((r_item or {}).get("gitFolder") or {}).get("folderUri")
+                        furi = (
+                            ((r_item or {}).get("gitFolder") or {}).get("folderUri")
+                            or (r_item or {}).get("folderUri")
+                        )
                         if furi:
                             existing_uri_to_proj_id[str(furi).rstrip("/").lower()] = str(pid)
             except Exception:
@@ -1129,7 +1156,7 @@ def main() -> int:
 
     if args.input_jsonl:
         jpath = Path(args.input_jsonl).expanduser().resolve()
-        evts, fid, fcwd, _, _ = parse_jsonl_events(jpath)
+        evts, fid, fcwd, _, _, _ = parse_jsonl_events(jpath)
         fid = fid or deterministic_uuid_v4("jsonl", str(jpath))
         ovr = custom_thread_titles.get(fid, "")
         conv = build_converted_session(
@@ -1235,10 +1262,10 @@ def main() -> int:
                 return None
             if ck in primary_root_map:
                 return codex_projects[primary_root_map[ck]]
-            for rk, cpid in primary_root_map.items():
+            for rk, cpid in sorted(primary_root_map.items(), key=lambda kv: len(kv[0]), reverse=True):
                 if ck.startswith(rk.rstrip("/") + "/"):
                     return codex_projects[cpid]
-            for rk, cpid, _ in secondary_roots:
+            for rk, cpid, _ in sorted(secondary_roots, key=lambda x: (x[2], -len(x[0]))):
                 if ck == rk or ck.startswith(rk.rstrip("/") + "/"):
                     return codex_projects[cpid]
             return None
@@ -1311,46 +1338,92 @@ def main() -> int:
 
         by_id: Dict[str, Dict[str, Any]] = {}
 
-        # A. Scan .jsonl files in sessions/ and archived_sessions/
+        # Map Codex segmented rollout filenames (<root_uuid>_<segment_uuid>.jsonl[.zst]) back to root_uuid
+        segment_to_root: Dict[str, str] = {}
         for sub in ("sessions", "archived_sessions"):
             sp = codex_dir / sub
             if not sp.is_dir():
                 continue
+            for rfile in sp.rglob("*_*"):
+                if not rfile.is_file():
+                    continue
+                m_pair = RX_UUID_PAIR.search(rfile.name)
+                if m_pair:
+                    root_u, seg_u = m_pair.group(1).lower(), m_pair.group(2).lower()
+                    if seg_u != root_u:
+                        segment_to_root[seg_u] = root_u
+
+        # Follow transitive segment chains if any
+        for seg_u in list(segment_to_root.keys()):
+            cur = segment_to_root[seg_u]
+            seen_u = {seg_u}
+            while cur in segment_to_root and cur not in seen_u:
+                seen_u.add(cur)
+                cur = segment_to_root[cur]
+            segment_to_root[seg_u] = cur
+
+        # A. Scan .jsonl files in sessions/ and archived_sessions/, grouping multi-segment rollouts
+        jsonl_segments: Dict[str, List[Tuple[int, str, List[Dict[str, Any]], Optional[str], Optional[str], Optional[str], bool]]] = {}
+        for sub in ("sessions", "archived_sessions"):
+            sp = codex_dir / sub
+            if not sp.is_dir():
+                continue
+            is_arch = sub == "archived_sessions"
             for jfile in sp.rglob("*.jsonl"):
-                evts, fid, fcwd, frole, fsrc = parse_jsonl_events(jfile)
-                fid = (fid or jfile.stem).lower()
-                skip = check_skip(fid, sqlite_meta.get(fid), frole, fsrc)
-                if skip == "guardian":
-                    skipped_guardian += 1
-                    continue
-                if skip == "subagent":
-                    skipped_subagent += 1
-                    continue
-                if skip is not None:
-                    continue
-
-                m = resolve_meta(fid, fcwd, sub == "archived_sessions")
-                pm = m["proj"]
-                conv = build_converted_session(
-                    fid,
-                    m["title"],
-                    args.title_prefix,
-                    m["cwd"],
-                    m["archived"],
-                    pm["agy_project_id"] if pm else "outside-of-project",
-                    pm["name"] if pm else "",
-                    pm["folder_uri"] if pm else "",
-                    m["created_at"],
-                    m["updated_at"],
-                    evts,
+                evts, fid, fcwd, frole, fsrc, ford = parse_jsonl_events(jfile)
+                raw_fid = (fid or jfile.stem).lower()
+                root_fid = segment_to_root.get(raw_fid, raw_fid)
+                jsonl_segments.setdefault(root_fid, []).append(
+                    (ford, jfile.name, evts, fcwd, frole, fsrc, is_arch)
                 )
-                if not conv:
-                    skipped_empty += 1
-                    continue
-                if fid not in by_id or len(conv["steps"]) > len(by_id[fid]["steps"]):
-                    by_id[fid] = conv
 
-        # B. Scan thread_history_*.sqlite for migrated threads
+        for fid, segs in jsonl_segments.items():
+            segs.sort(key=lambda x: (x[0], x[1]))
+            merged_evts: List[Dict[str, Any]] = []
+            fcwd_merged: Optional[str] = None
+            frole_merged: Optional[str] = None
+            fsrc_merged: Optional[str] = None
+            arch_merged = all(x[6] for x in segs)
+            for _, _, evts, fcwd, frole, fsrc, _ in segs:
+                merged_evts.extend(evts)
+                if fcwd:
+                    fcwd_merged = fcwd
+                if not frole_merged and frole:
+                    frole_merged = frole
+                if not fsrc_merged and fsrc:
+                    fsrc_merged = fsrc
+
+            skip = check_skip(fid, sqlite_meta.get(fid), frole_merged, fsrc_merged)
+            if skip == "guardian":
+                skipped_guardian += 1
+                continue
+            if skip == "subagent":
+                skipped_subagent += 1
+                continue
+            if skip is not None:
+                continue
+
+            m = resolve_meta(fid, fcwd_merged, arch_merged)
+            pm = m["proj"]
+            conv = build_converted_session(
+                fid,
+                m["title"],
+                args.title_prefix,
+                m["cwd"],
+                m["archived"],
+                pm["agy_project_id"] if pm else "outside-of-project",
+                pm["name"] if pm else "",
+                pm["folder_uri"] if pm else "",
+                m["created_at"],
+                m["updated_at"],
+                merged_evts,
+            )
+            if not conv:
+                skipped_empty += 1
+                continue
+            by_id[fid] = conv
+
+        # B. Scan thread_history_*.sqlite (merging segmented rollout IDs and using indexed thread_id lookup)
         hist_db = find_latest_versioned_sqlite(codex_dir, "thread_history")
         if hist_db and hist_db.is_file():
             hconn = open_sqlite_ro(hist_db)
@@ -1359,50 +1432,74 @@ def main() -> int:
                     r[0].lower()
                     for r in hconn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
                 }
-                cand_ids: Set[str] = set(sqlite_meta.keys())
+                root_to_raw_ids: Dict[str, List[str]] = {}
+                for meta_tid, meta_row in sqlite_meta.items():
+                    raw_val = str(meta_row.get("id") or meta_tid)
+                    r_tid = segment_to_root.get(meta_tid, meta_tid)
+                    lst = root_to_raw_ids.setdefault(r_tid, [])
+                    if raw_val not in lst:
+                        lst.append(raw_val)
                 if "thread_turns" in htables:
                     for r in hconn.execute("SELECT DISTINCT thread_id FROM thread_turns").fetchall():
                         if r[0]:
-                            cand_ids.add(str(r[0]).lower())
+                            raw_val = str(r[0])
+                            low_val = raw_val.lower()
+                            r_tid = segment_to_root.get(low_val, low_val)
+                            lst = root_to_raw_ids.setdefault(r_tid, [])
+                            if raw_val not in lst:
+                                lst.append(raw_val)
 
-                targets: List[str] = []
-                for cid in cand_ids:
-                    if cid in by_id:
-                        continue
-                    skip = check_skip(cid, sqlite_meta.get(cid), None, None)
-                    if skip == "guardian":
-                        skipped_guardian += 1
-                        continue
-                    if skip == "subagent":
-                        skipped_subagent += 1
-                        continue
-                    if skip is not None:
-                        continue
-                    targets.append(cid)
+                target_roots: List[str] = []
+                for cid in root_to_raw_ids:
+                    if cid not in by_id:
+                        skip = check_skip(cid, sqlite_meta.get(cid), None, None)
+                        if skip == "guardian":
+                            skipped_guardian += 1
+                            continue
+                        if skip == "subagent":
+                            skipped_subagent += 1
+                            continue
+                        if skip is not None:
+                            continue
+                    else:
+                        if check_skip(cid, sqlite_meta.get(cid), None, None) is not None:
+                            continue
+                    target_roots.append(cid)
 
-                if "thread_items" in htables and targets:
+                if "thread_items" in htables and target_roots:
                     batch_size = 40
-                    for bi in range(0, len(targets), batch_size):
-                        chunk = targets[bi : bi + batch_size]
-                        placeholders = ",".join("?" for _ in chunk)
+                    for bi in range(0, len(target_roots), batch_size):
+                        root_chunk = target_roots[bi : bi + batch_size]
+                        raw_query_ids: List[str] = []
+                        raw_to_root: Dict[str, str] = {}
+                        for r_tid in root_chunk:
+                            for rv in root_to_raw_ids.get(r_tid, [r_tid]):
+                                raw_query_ids.append(rv)
+                                raw_to_root[rv.lower()] = r_tid
+
+                        placeholders = ",".join("?" for _ in raw_query_ids)
                         rows = hconn.execute(
                             f"SELECT thread_id, rollout_ordinal, created_at_ms, item_type, item_json "
-                            f"FROM thread_items WHERE lower(thread_id) IN ({placeholders}) "
-                            f"ORDER BY thread_id, rollout_ordinal ASC",
-                            chunk,
+                            f"FROM thread_items WHERE thread_id IN ({placeholders})",
+                            raw_query_ids,
                         ).fetchall()
-                        grouped: Dict[str, List[Dict[str, Any]]] = {}
+                        grouped_raw: Dict[str, List[Tuple[int, int, Dict[str, Any]]]] = {}
                         for r in rows:
-                            tid = str(r["thread_id"]).lower()
+                            r_tid = raw_to_root.get(str(r["thread_id"]).lower(), str(r["thread_id"]).lower())
+                            ord_v = int(r["rollout_ordinal"] or 0)
+                            cms_v = int(r["created_at_ms"] or 0)
                             ts = parse_timestamp(r["created_at_ms"], datetime.now(timezone.utc))
                             ev = parse_sqlite_item(r["item_type"], r["item_json"], ts)
                             if ev:
-                                grouped.setdefault(tid, []).append(ev)
+                                grouped_raw.setdefault(r_tid, []).append((ord_v, cms_v, ev))
 
-                        for tid in chunk:
-                            if tid not in grouped:
-                                skipped_empty += 1
+                        for tid in root_chunk:
+                            if tid not in grouped_raw:
+                                if tid not in by_id:
+                                    skipped_empty += 1
                                 continue
+                            items_sorted = sorted(grouped_raw[tid], key=lambda x: (x[0], x[1]))
+                            ev_list = [x[2] for x in items_sorted]
                             m = resolve_meta(tid, "", False)
                             pm = m["proj"]
                             conv = build_converted_session(
@@ -1416,12 +1513,14 @@ def main() -> int:
                                 pm["folder_uri"] if pm else "",
                                 m["created_at"],
                                 m["updated_at"],
-                                grouped[tid],
+                                ev_list,
                             )
                             if not conv:
-                                skipped_empty += 1
+                                if tid not in by_id:
+                                    skipped_empty += 1
                                 continue
-                            by_id[tid] = conv
+                            if tid not in by_id or len(conv["steps"]) > len(by_id[tid]["steps"]):
+                                by_id[tid] = conv
             finally:
                 hconn.close()
 
@@ -1521,7 +1620,17 @@ def main() -> int:
             print(f"[Cache] Cleared stale agyhub_summaries_proto.pb (backed up -> {bak_pb})")
 
         for pf in staged_project_files:
-            shutil.copy2(pf, target_projects / pf.name)
+            dst_pf = target_projects / pf.name
+            if dst_pf.is_file():
+                # Preserve existing Antigravity project config (e.g. defaultBranch, multi-folder resources)
+                # unless the user explicitly renamed this project via rename-config.json
+                matched_cpid = next(
+                    (cpid for cpid, pm in codex_projects.items() if pm["agy_project_id"] == pf.stem),
+                    None,
+                )
+                if not (matched_cpid and matched_cpid in custom_project_names):
+                    continue
+            shutil.copy2(pf, dst_pf)
 
         for conv in converted_sessions:
             cid = conv["agy_conversation_id"]
