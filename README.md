@@ -1,8 +1,11 @@
 # Codex to Antigravity (`codex-to-antigravity`)
 
-Migrate your local **OpenAI Codex (`~/.codex`)** conversation history and project groupings into **Google Antigravity**'s native **Projects** and **Conversations** sidebar — packaged as a cross-platform Antigravity **Plugin & Skill** plus standalone CLI scripts.
+Migrate your local **OpenAI Codex (`~/.codex`)** and **Qoder (`~/.qoder`)** conversation history and project groupings into **Google Antigravity**'s native **Projects** and **Conversations** sidebar — packaged as a cross-platform Antigravity **Plugin & Skill** plus standalone CLI scripts.
 
 - **Cross-Platform**: Verified on **macOS**, **Windows**, and **Linux**.
+- **Codex + Qoder Smart Continuation Merge (`--source auto|codex|qoder|both`)**:
+  - Converts both `~/.codex` threads and `~/.qoder/projects/<slug>/*.jsonl` active-leaf session trees.
+  - When a session started in Codex and was later continued in Qoder, automatically merges the Codex history (UUIDv5) with Qoder's new turns (UUIDv4, plaintext compaction summaries, thinking, and tool calls) into a **single unified conversation**, while deduplicating zero-delta migrated snapshots.
 - **Zero Third-Party Dependencies**:
   - **macOS & Linux**: Pure Python 3.8+ standard library (`sqlite3`, zero `pip install` needed) via `codex2agy.sh` / `codex2agy.py`.
   - **Windows**: Native PowerShell + built-in `winsqlite3.dll` via `codex2agy.ps1` (works out-of-the-box on fresh Windows 10/11 machines even without Python installed).

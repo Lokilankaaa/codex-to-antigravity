@@ -13,8 +13,9 @@ This reference documents the exact schema mapping implemented by `codex2agy.py` 
 | `sessions/YYYY/MM/DD/rollout-*.jsonl` & `archived_sessions/*.jsonl` | Active and archived JSONL rollouts (including `<root_uuid>_<segment_uuid>` continuation segments) | `session_meta` (`id` / `session_id`), `turn_context`, `response_item` (`message`, `reasoning`, `function_call`, `local_shell_call`), `event_msg` |
 | `session_index.jsonl` | Lightweight thread title index | `id`, `thread_name`, `updated_at` |
 
-### Segmented Rollout Merging
-Long Codex Desktop conversations rotate into continuation files named `rollout-<timestamp>-<root_uuid>_<segment_uuid>.jsonl[.zst]` with monotonically increasing `rollout_ordinal`s, and `thread_history_<N>.sqlite` indexes items per `<segment_uuid>`. Both `codex2agy.py` and `codex2agy.ps1` map `<segment_uuid> -> <root_uuid>` transitively and merge all segments ordered by `(rollout_ordinal, created_at_ms)` back into the canonical `<root_uuid>` thread.
+### Segmented Rollout Merging & Qoder Continuation Merging
+- **Codex Segmented Rollouts**: Long Codex Desktop conversations rotate into continuation files named `rollout-<timestamp>-<root_uuid>_<segment_uuid>.jsonl[.zst]` with monotonically increasing `rollout_ordinal`s, and `thread_history_<N>.sqlite` indexes items per `<segment_uuid>`. Both `codex2agy.py` and `codex2agy.ps1` map `<segment_uuid> -> <root_uuid>` transitively and merge all segments ordered by `(rollout_ordinal, created_at_ms)` back into the canonical `<root_uuid>` thread.
+- **Qoder Sessions & Codex→Qoder Continuations (`~/.qoder/projects/<slug>/<session_uuid>.jsonl`)**: Qoder stores conversations as a `parentUuid` / `active-leaf` JSONL tree, encoding inherited Codex history with UUIDv5 records and native Qoder turns with UUIDv4 records (including plaintext `isCompactSummary` blocks, `thinking`, and `tool_use`). In `--source auto` / `both` mode, Qoder sessions matching a Codex root thread with `native_msg_count > 0` append their new Qoder turns directly onto the canonical Codex thread (`source: "codex+qoder"`), while zero-delta migrated snapshots (`native_msg_count == 0`) are automatically deduplicated. Pure Qoder sessions (`migrated_msg_count == 0`) are imported natively (`source: "qoder"`).
 
 ### Project Resolution Order
 1. Explicit override in `rename-config.json` (`thread_projects`).

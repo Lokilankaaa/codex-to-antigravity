@@ -1,12 +1,14 @@
 ---
 name: import-codex-sessions
 description: >-
-  Imports local OpenAI Codex conversation history and project groupings (~/.codex) into Google Antigravity's native Projects and Conversations sidebar on macOS, Windows, and Linux. Use this skill whenever the user asks to import, migrate, convert, or bring over their Codex sessions, chat history, rollouts, or projects into Antigravity (例如：导入 Codex 会话、迁移本机 Codex 历史记录与项目分组).
+  Imports local OpenAI Codex (~/.codex) and Qoder (~/.qoder) conversation history and project groupings into Google Antigravity's native Projects and Conversations sidebar on macOS, Windows, and Linux (automatically merging Codex threads that were continued in Qoder). Use this skill whenever the user asks to import, migrate, convert, or bring over their Codex or Qoder sessions, chat history, rollouts, or projects into Antigravity (例如：导入 Codex/Qoder 会话、迁移本机 Codex 与 Qoder 历史记录与项目分组).
 ---
 
-# Import Local OpenAI Codex Sessions & Projects
+# Import Local Codex & Qoder Sessions into Antigravity
 
-Convert and import local OpenAI Codex (`~/.codex` or `$CODEX_HOME`) threads and project groupings into Google Antigravity's native 5-layer session format on **macOS**, **Windows**, and **Linux** with zero third-party dependencies.
+Convert and import local OpenAI Codex (`~/.codex` or `$CODEX_HOME`) and Qoder (`~/.qoder` or `$QODER_HOME`) threads and project groupings into Google Antigravity's native 5-layer session format on **macOS**, **Windows**, and **Linux** with zero third-party dependencies.
+
+- **`--source auto` (default)**: Imports both Codex and Qoder when present, **automatically merging** sessions that started in Codex and continued in Qoder (UUIDv5 -> UUIDv4 active-leaf chain) into a single complete timeline while skipping zero-delta duplicate snapshots. Pass `--source codex` or `--source qoder` (`-Source codex|qoder`) to restrict to one source.
 
 For low-level SQLite DDL, Protobuf wire tags, and URI normalization details, read [format-spec.md](./references/format-spec.md).
 

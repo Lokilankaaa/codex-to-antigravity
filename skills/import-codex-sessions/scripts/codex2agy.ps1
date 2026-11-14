@@ -59,7 +59,10 @@
     Read back all generated SQLite .db, .pbtxt, and project .json files and verify integrity.
 #>
 param(
+    [ValidateSet("auto", "codex", "qoder", "both")]
+    [string]$Source = "auto",
     [string]$CodexDir = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }),
+    [string]$QoderDir = $(if ($env:QODER_HOME) { $env:QODER_HOME } else { Join-Path $HOME ".qoder" }),
     [string]$InputJsonl = "",
     [string]$ThreadId = "",
     [string]$OutputDir = (Join-Path $PSScriptRoot "dist-agy"),
@@ -586,8 +589,22 @@ namespace CodexToAgyV2 {
         public int SessionCount;
     }
 
+    public class QoderParseResult {
+        public string SessionId;
+        public string Cwd;
+        public DateTimeOffset FirstTs = DateTimeOffset.MinValue;
+        public DateTimeOffset LastTs = DateTimeOffset.MinValue;
+        public string FirstUser = "";
+        public List<RawTurnEvent> MigratedEvents = new List<RawTurnEvent>();
+        public List<RawTurnEvent> NativeEvents = new List<RawTurnEvent>();
+        public int MigratedMsgCount;
+        public int NativeMsgCount;
+    }
+
     public class ConvertedSession {
         public string CodexThreadId;
+        public string Source = "codex";
+        public string QoderSessionId = "";
         public string AgyConversationId;
         public string AgyTrajectoryId;
         public string AgyExecutionId;
@@ -601,17 +618,18 @@ namespace CodexToAgyV2 {
         public DateTimeOffset CreatedAt;
         public DateTimeOffset UpdatedAt;
         public List<AgyStepModel> Steps = new List<AgyStepModel>();
+        public List<RawTurnEvent> RawEvents = new List<RawTurnEvent>();
         public int UserTurns;
         public int AssistantTurns;
     }
 
     public static class SessionConverter {
         private static readonly Regex RxEnvBlock = new Regex(
-            @"^\s*<(environment_context|permissions|collaboration_mode|app-context|user_instructions|system-reminder|turn_aborted|subagent_notification|external_codex_[a-z0-9_]+)\b[\s\S]*</\1>\s*$",
+            @"^\s*<(environment_context|permissions|collaboration_mode|app-context|user_instructions|skills_instructions|recommended_plugins|system-reminder|turn_aborted|subagent_notification|external_codex_[a-z0-9_]+)\b[\s\S]*</\1>\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static readonly Regex RxInlineSysTags = new Regex(
-            @"<(environment_context|permissions[^>\s]*|collaboration_mode|app-context|user_instructions|system-reminder|external_codex_[a-z0-9_]+)\b[^>]*>[\s\S]*?</\1>",
+            @"<(environment_context|permissions[^>\s]*|collaboration_mode|app-context|user_instructions|skills_instructions|recommended_plugins|system-reminder|external_codex_[a-z0-9_]+)\b[^>]*>[\s\S]*?</\1>",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static string GetStr(IDictionary d, string k) {
@@ -871,12 +889,114 @@ namespace CodexToAgyV2 {
             return null;
         }
 
+        public static QoderParseResult ParseQoderJsonl(string path, JavaScriptSerializer ser) {
+            var res = new QoderParseResult();
+            res.SessionId = Path.GetFileNameWithoutExtension(path).ToLowerInvariant();
+            res.Cwd = "";
+            var nodes = new Dictionary<string, IDictionary>(StringComparer.OrdinalIgnoreCase);
+            var order = new List<string>();
+            string leaf = null;
+
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fs, Encoding.UTF8)) {
+                string line;
+                while ((line = sr.ReadLine()) != null) {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    IDictionary obj;
+                    try { obj = ser.DeserializeObject(line) as IDictionary; } catch { continue; }
+                    if (obj == null) continue;
+                    string t = GetStr(obj, "type");
+                    if (t == "active-leaf" && !string.IsNullOrEmpty(GetStr(obj, "leafUuid"))) leaf = GetStr(obj, "leafUuid");
+                    if (string.IsNullOrEmpty(res.Cwd) && !string.IsNullOrEmpty(GetStr(obj, "cwd"))) res.Cwd = GetStr(obj, "cwd");
+                    string u = GetStr(obj, "uuid");
+                    if (!string.IsNullOrEmpty(u) && t != "file-history-snapshot") {
+                        nodes[u] = obj;
+                        order.Add(u);
+                    }
+                }
+            }
+            if (order.Count == 0) return res;
+            if (string.IsNullOrEmpty(leaf) || !nodes.ContainsKey(leaf)) leaf = order[order.Count - 1];
+
+            var chain = new List<IDictionary>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string cur = leaf;
+            while (!string.IsNullOrEmpty(cur) && nodes.ContainsKey(cur) && !seen.Contains(cur)) {
+                seen.Add(cur);
+                IDictionary o = nodes[cur];
+                chain.Add(o);
+                cur = GetStr(o, "parentUuid") ?? GetStr(o, "logicalParentUuid");
+            }
+            chain.Reverse();
+
+            DateTimeOffset lastTs = DateTimeOffset.UtcNow;
+            foreach (var obj in chain) {
+                string t = GetStr(obj, "type");
+                if (!string.IsNullOrEmpty(GetStr(obj, "timestamp"))) {
+                    lastTs = ParseTimestamp(GetStr(obj, "timestamp"), lastTs);
+                    if (res.FirstTs == DateTimeOffset.MinValue && (t == "user" || t == "assistant")) res.FirstTs = lastTs;
+                }
+                string u = GetStr(obj, "uuid") ?? "";
+                bool isMig = (u.Length > 14 && u[14] == '5');
+                var dst = isMig ? res.MigratedEvents : res.NativeEvents;
+                IDictionary msg = obj.Contains("message") ? (obj["message"] as IDictionary) : null;
+                object cnt = (msg != null && msg.Contains("content")) ? msg["content"] : null;
+
+                if (t == "user") {
+                    if (obj.Contains("isCompactSummary") && Convert.ToBoolean(obj["isCompactSummary"])) {
+                        string sumTxt = ExtractContentParts(cnt, false);
+                        if (!string.IsNullOrEmpty(sumTxt)) res.NativeEvents.Add(new RawTurnEvent { Kind = "thinking", Text = "[Qoder Compaction Summary]\n" + TruncateOneLine(sumTxt, 1200), Timestamp = lastTs });
+                        continue;
+                    }
+                    bool hasToolRes = false;
+                    if (cnt is IEnumerable && !(cnt is string)) {
+                        foreach (var el in (IEnumerable)cnt) {
+                            var ed = el as IDictionary;
+                            if (ed != null && GetStr(ed, "type") == "tool_result") { hasToolRes = true; break; }
+                        }
+                    }
+                    if (hasToolRes || (obj.Contains("isMeta") && Convert.ToBoolean(obj["isMeta"]))) continue;
+                    string txt = ExtractContentParts(cnt, true);
+                    if (!string.IsNullOrEmpty(txt)) {
+                        if (isMig) res.MigratedMsgCount++; else res.NativeMsgCount++;
+                        if (string.IsNullOrEmpty(res.FirstUser)) res.FirstUser = txt;
+                        dst.Add(new RawTurnEvent { Kind = "user", Text = txt, Timestamp = lastTs });
+                    }
+                } else if (t == "assistant") {
+                    if (isMig) res.MigratedMsgCount++; else res.NativeMsgCount++;
+                    if (cnt is string && !string.IsNullOrWhiteSpace((string)cnt)) {
+                        dst.Add(new RawTurnEvent { Kind = "assistant", Text = ((string)cnt).Trim(), Timestamp = lastTs });
+                    } else if (cnt is IEnumerable) {
+                        foreach (var el in (IEnumerable)cnt) {
+                            var ed = el as IDictionary;
+                            if (ed == null) continue;
+                            string ct = GetStr(ed, "type");
+                            if (ct == "thinking") {
+                                string th = (GetStr(ed, "thinking") ?? "").Trim();
+                                if (!string.IsNullOrEmpty(th)) dst.Add(new RawTurnEvent { Kind = "thinking", Text = th, Timestamp = lastTs });
+                            } else if (ct == "tool_use") {
+                                string tn = GetStr(ed, "name") ?? "tool";
+                                string inp = ed.Contains("input") && ed["input"] != null ? ser.Serialize(ed["input"]) : "";
+                                dst.Add(new RawTurnEvent { Kind = "tool", Text = "[Tool] " + tn + ": " + TruncateOneLine(inp, 140), Timestamp = lastTs });
+                            } else if (ct == "text") {
+                                string tx = (GetStr(ed, "text") ?? "").Trim();
+                                if (!string.IsNullOrEmpty(tx)) dst.Add(new RawTurnEvent { Kind = "assistant", Text = tx, Timestamp = lastTs });
+                            }
+                        }
+                    }
+                }
+            }
+            if (res.MigratedMsgCount > 0 || res.NativeMsgCount > 0) res.LastTs = lastTs;
+            return res;
+        }
+
         public static ConvertedSession BuildConvertedSession(
             string codexThreadId, string rawTitle, string titlePrefix, string cwd, bool archived,
             string agyProjectId, string agyProjectName, string workspaceUri,
             DateTimeOffset metaCreated, DateTimeOffset metaUpdated, List<RawTurnEvent> events)
         {
             var conv = new ConvertedSession();
+            if (events != null) conv.RawEvents.AddRange(events);
             conv.CodexThreadId = codexThreadId.ToLowerInvariant();
             conv.AgyConversationId = AgyProtoBuilder.DeterministicUuidV4("agy-conv", conv.CodexThreadId);
             conv.AgyTrajectoryId = AgyProtoBuilder.DeterministicUuidV4("agy-traj", conv.CodexThreadId);
@@ -1494,11 +1614,21 @@ if (-not [string]::IsNullOrWhiteSpace($InputJsonl)) {
         $segmentToRoot[$segKey] = $cur
     }
 
+    $includeCodex = ($Source -in @("auto", "codex", "both")) -and (Test-Path $CodexDir)
+    $includeQoder = ($Source -in @("auto", "qoder", "both")) -and (Test-Path (Join-Path $QoderDir "projects"))
+    if ($Source -eq "codex") { $includeCodex = $true; $includeQoder = $false }
+    if ($Source -eq "qoder") { $includeCodex = $false; $includeQoder = $true }
+    $mergedQoder = 0
+    $importedQoderNative = 0
+    $skippedQoderDup = 0
+
     # A. Scan .jsonl files in sessions & archived_sessions, grouping multi-segment rollouts
     $jsonlFiles = @()
-    foreach ($sub in @("sessions", "archived_sessions")) {
-        $p = Join-Path $CodexDir $sub
-        if (Test-Path $p) { $jsonlFiles += Get-ChildItem -Path $p -Filter "*.jsonl" -Recurse -File -ErrorAction SilentlyContinue }
+    if ($includeCodex) {
+        foreach ($sub in @("sessions", "archived_sessions")) {
+            $p = Join-Path $CodexDir $sub
+            if (Test-Path $p) { $jsonlFiles += Get-ChildItem -Path $p -Filter "*.jsonl" -Recurse -File -ErrorAction SilentlyContinue }
+        }
     }
     $jsonlSegments = @{}
     foreach ($f in $jsonlFiles) {
@@ -1546,7 +1676,7 @@ if (-not [string]::IsNullOrWhiteSpace($InputJsonl)) {
     }
 
     # B. Scan thread_history_*.sqlite (merging segmented rollout IDs)
-    $histDbPath = Find-LatestVersionedSqlite $CodexDir "thread_history"
+    $histDbPath = if ($includeCodex) { Find-LatestVersionedSqlite $CodexDir "thread_history" } else { $null }
     if ($histDbPath -and (Test-Path -LiteralPath $histDbPath)) {
         $hdb = New-Object CodexToAgyV2.WinSqlite($histDbPath, $true)
         try {
@@ -1636,6 +1766,84 @@ if (-not [string]::IsNullOrWhiteSpace($InputJsonl)) {
         } finally { $hdb.Dispose() }
     }
 
+    # C. Scan ~/.qoder/projects/*/*.jsonl (merging Codex->Qoder continued threads & importing Qoder-native sessions)
+    if ($includeQoder -and (Test-Path (Join-Path $QoderDir "projects"))) {
+        $qFiles = Get-ChildItem -Path (Join-Path $QoderDir "projects") -Filter "*.jsonl" -Recurse -Depth 2 -File -ErrorAction SilentlyContinue | Sort-Object FullName
+        foreach ($qf in $qFiles) {
+            if ($qf.Directory.Name -ieq "subagents") { continue }
+            $qinfo = [CodexToAgyV2.SessionConverter]::ParseQoderJsonl($qf.FullName, $ser)
+            $qid = $qinfo.SessionId
+            $matchedCid = $null
+            if ($qinfo.MigratedMsgCount -gt 0 -and $qinfo.FirstTs -ne [DateTimeOffset]::MinValue) {
+                $qFu = ($qinfo.FirstUser -replace "\s+", " ").Trim()
+                $qCwdL = ([CodexToAgyV2.SessionConverter]::NormalizeWinPath($qinfo.Cwd)).ToLowerInvariant()
+                $bestGap = [double]::MaxValue
+                $bestSame = $false
+                $candIds = New-Object 'System.Collections.Generic.HashSet[string]'
+                foreach ($bk in $byId.Keys) { [void]$candIds.Add($bk) }
+                foreach ($sk in $sqliteMeta.Keys) { [void]$candIds.Add((if ($segmentToRoot.ContainsKey($sk)) { $segmentToRoot[$sk] } else { $sk })) }
+                foreach ($cid in $candIds) {
+                    $sm = if ($sqliteMeta.ContainsKey($cid)) { $sqliteMeta[$cid] } else { $null }
+                    $cc = if ($byId.ContainsKey($cid)) { $byId[$cid] } else { $null }
+                    $cDt = if ($sm -and $sm["created_at"] -ne $null) { [CodexToAgyV2.SessionConverter]::ParseTimestamp([string]$sm["created_at"], [DateTimeOffset]::MinValue) } elseif ($cc) { $cc.CreatedAt } else { [DateTimeOffset]::MinValue }
+                    if ($cDt -eq [DateTimeOffset]::MinValue) { continue }
+                    $gap = [Math]::Abs(($cDt - $qinfo.FirstTs).TotalSeconds)
+                    $cFuRaw = if ($sm -and $sm["first_user_message"]) { [CodexToAgyV2.SessionConverter]::CleanUserText([string]$sm["first_user_message"]) } elseif ($cc -and $cc.Steps.Count -gt 0) { $cc.Steps[0].Content } else { "" }
+                    $cFu = ($cFuRaw -replace "\s+", " ").Trim()
+                    $cCwdL = ([CodexToAgyV2.SessionConverter]::NormalizeWinPath((if ($sm -and $sm["cwd"]) { [string]$sm["cwd"] } elseif ($cc) { $cc.Cwd } else { "" }))).ToLowerInvariant()
+                    $sameCwd = ($qCwdL -ne "" -and $qCwdL -eq $cCwdL)
+                    $pLen = [Math]::Min(28, [Math]::Min($qFu.Length, $cFu.Length))
+                    $sameTxt = ($pLen -ge 6) -and ($cFu.StartsWith($qFu.Substring(0, $pLen)) -or $qFu.StartsWith($cFu.Substring(0, $pLen)))
+                    if (($sameTxt -and ($sameCwd -or $gap -le 604800)) -or ($gap -le 300 -and ($sameTxt -or $sameCwd))) {
+                        if ($matchedCid -eq $null -or ($sameTxt -and -not $bestSame) -or ($sameTxt -eq $bestSame -and $gap -lt $bestGap)) {
+                            $matchedCid = $cid; $bestSame = $sameTxt; $bestGap = $gap
+                        }
+                    }
+                }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($ThreadId) -and ($qid -ine $ThreadId.Trim()) -and ($matchedCid -ine $ThreadId.Trim())) { continue }
+
+            if ($matchedCid -and $byId.ContainsKey($matchedCid)) {
+                if ($qinfo.NativeMsgCount -le 0) { $skippedQoderDup++; continue }
+                $ex = $byId[$matchedCid]
+                if ($ex.Source -eq "codex") {
+                    $comb = New-Object 'System.Collections.Generic.List[CodexToAgyV2.RawTurnEvent]'
+                    $comb.AddRange($ex.RawEvents)
+                    $hTs = if ($qinfo.NativeEvents.Count -gt 0) { $qinfo.NativeEvents[0].Timestamp } else { $ex.UpdatedAt }
+                    $comb.Add((New-Object CodexToAgyV2.RawTurnEvent -Property @{ Kind = "thinking"; Text = "[Qoder Session " + $qid.Substring(0, 8) + "] Continued from Codex thread " + $matchedCid.Substring(0, 8); Timestamp = $hTs }))
+                    $comb.AddRange($qinfo.NativeEvents)
+                    $mCwd = if (-not [string]::IsNullOrEmpty($qinfo.Cwd)) { $qinfo.Cwd } else { $ex.Cwd }
+                    $m = Resolve-ThreadMeta $matchedCid $mCwd $ex.Archived
+                    $nUpd = if ($qinfo.LastTs -gt $ex.UpdatedAt) { $qinfo.LastTs } else { $ex.UpdatedAt }
+                    $agyPid = if ($m.Project) { $m.Project.AgyProjectId } else { $ex.AgyProjectId }
+                    $pName = if ($m.Project) { $m.Project.Name } else { $ex.AgyProjectName }
+                    $pUri = if ($m.Project) { $m.Project.FolderUri } else { $ex.WorkspaceUri }
+                    $reb = [CodexToAgyV2.SessionConverter]::BuildConvertedSession($matchedCid, (if ($m.Title) { $m.Title } else { $ex.Title }), $TitlePrefix, $m.Cwd, $ex.Archived, $agyPid, $pName, $pUri, $ex.CreatedAt, $nUpd, $comb)
+                    if ($reb -ne $null) {
+                        $reb.Source = "codex+qoder"; $reb.QoderSessionId = $qid
+                        $byId[$matchedCid] = $reb; $mergedQoder++
+                    }
+                    continue
+                }
+            }
+            if ($includeCodex -and $matchedCid -and $qinfo.NativeMsgCount -le 0) { $skippedQoderDup++; continue }
+            $evAll = New-Object 'System.Collections.Generic.List[CodexToAgyV2.RawTurnEvent]'
+            $evAll.AddRange($qinfo.MigratedEvents); $evAll.AddRange($qinfo.NativeEvents)
+            if ($evAll.Count -eq 0) { $skippedEmpty++; continue }
+            $rTitle = if ($customThreadTitles.ContainsKey($qid)) { $customThreadTitles[$qid] } else { "" }
+            if ([string]::IsNullOrEmpty($rTitle) -and $matchedCid) {
+                $mc = Resolve-ThreadMeta $matchedCid $qinfo.Cwd $false
+                if ($mc.Title) { $rTitle = $mc.Title }
+            }
+            $proj = Resolve-SessionProject $qid "" $qinfo.Cwd
+            $conv = [CodexToAgyV2.SessionConverter]::BuildConvertedSession($qid, $rTitle, $TitlePrefix, $qinfo.Cwd, $false, (if ($proj) { $proj.AgyProjectId } else { "outside-of-project" }), (if ($proj) { $proj.Name } else { "" }), (if ($proj) { $proj.FolderUri } else { "" }), $qinfo.FirstTs, $qinfo.LastTs, $evAll)
+            if ($conv -eq $null) { $skippedEmpty++; continue }
+            $conv.Source = if ($qinfo.MigratedMsgCount -gt 0) { "codex+qoder" } else { "qoder" }
+            $conv.QoderSessionId = $qid
+            $byId[$qid] = $conv; $importedQoderNative++
+        }
+    }
+
     foreach ($v in ($byId.Values | Sort-Object UpdatedAt -Descending)) {
         $convertedSessions.Add($v)
         foreach ($pm in $codexProjects.Values) {
@@ -1684,7 +1892,9 @@ $manifest = @()
 foreach ($conv in $convertedSessions) {
     [CodexToAgyV2.SessionConverter]::WriteAntigravityConversationFiles($conv, $OutputDir, $ser)
     $manifest += [ordered]@{
+        source              = $conv.Source
         codex_thread_id     = $conv.CodexThreadId
+        qoder_session_id    = $conv.QoderSessionId
         agy_conversation_id = $conv.AgyConversationId
         agy_trajectory_id   = $conv.AgyTrajectoryId
         agy_project_id      = $conv.AgyProjectId
@@ -1703,8 +1913,9 @@ foreach ($conv in $convertedSessions) {
 [CodexToAgyV2.SessionConverter]::UpsertSummariesDb($stagingSumDb, $convertedSessions)
 [System.IO.File]::WriteAllText((Join-Path $OutputDir "mapping.json"), ($manifest | ConvertTo-Json -Depth 6), $utf8NoBom)
 
-Write-Host ("[Stage] Converted {0} sessions & {1} projects -> {2} (Skipped Guardian={3}, Subagent={4}, Empty={5})" -f `
-    $convertedSessions.Count, $stagedProjectFiles.Count, $OutputDir, $skippedGuardian, $skippedSubagent, $skippedEmpty)
+$qoderStat = if ($includeQoder) { ", QoderMerged=$mergedQoder, QoderNative=$importedQoderNative, QoderDupSkipped=$skippedQoderDup" } else { "" }
+Write-Host ("[Stage] Converted {0} sessions & {1} projects -> {2} (Skipped Guardian={3}, Subagent={4}, Empty={5}{6})" -f `
+    $convertedSessions.Count, $stagedProjectFiles.Count, $OutputDir, $skippedGuardian, $skippedSubagent, $skippedEmpty, $qoderStat)
 
 if ($Verify -or $Install) {
     $vCount = [CodexToAgyV2.SessionConverter]::VerifyOutputDir($OutputDir)

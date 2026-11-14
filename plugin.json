@@ -1,15 +1,15 @@
 {
   "name": "codex-to-antigravity",
-  "displayName": "Codex to Antigravity",
-  "version": "1.1.0",
+  "displayName": "Codex & Qoder to Antigravity",
+  "version": "1.2.0",
   "author": "Lokilankaaa",
   "homepage": "https://github.com/Lokilankaaa/codex-to-antigravity",
   "repository": "https://github.com/Lokilankaaa/codex-to-antigravity",
-  "description": "Migrate local OpenAI Codex sessions and project groupings (~/.codex) into Google Antigravity native Projects and Conversations on macOS, Windows, and Linux.",
+  "description": "Migrate local OpenAI Codex (~/.codex) and Qoder (~/.qoder) sessions and project groupings into Google Antigravity native Projects and Conversations on macOS, Windows, and Linux.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
-    "Migrate my local Codex sessions and projects into Antigravity",
-    "Preview my ~/.codex threads and clean up their titles before importing",
-    "迁移我本机的 Codex 会话和项目分组到 Antigravity"
+    "Migrate my local Codex and Qoder sessions into Antigravity",
+    "Preview my ~/.codex and ~/.qoder threads and clean up their titles before importing",
+    "迁移我本机的 Codex 与 Qoder 会话和项目分组到 Antigravity"
   ]
 }

@@ -32,12 +32,14 @@ EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 RX_ENV_BLOCK = re.compile(
     r"^\s*<(environment_context|permissions|collaboration_mode|app-context|user_instructions|"
+    r"skills_instructions|recommended_plugins|"
     r"system-reminder|turn_aborted|subagent_notification|external_codex_[a-z0-9_]+)\b[\s\S]*</\1>\s*$",
     re.IGNORECASE,
 )
 RX_INLINE_SYS_TAGS = re.compile(
     r"<(environment_context|permissions[^>\s]*|collaboration_mode|app-context|"
-    r"user_instructions|system-reminder|external_codex_[a-z0-9_]+)\b[^>]*>[\s\S]*?</\1>",
+    r"user_instructions|skills_instructions|recommended_plugins|"
+    r"system-reminder|external_codex_[a-z0-9_]+)\b[^>]*>[\s\S]*?</\1>",
     re.IGNORECASE,
 )
 RX_WIN_DRIVE = re.compile(r"^[A-Za-z]:([\\/]|$)")
@@ -687,6 +689,203 @@ def parse_sqlite_item(item_type_col: Optional[str], item_json: Optional[str], ts
     return None
 
 
+def _is_qoder_migrated_uuid(u: Optional[str]) -> bool:
+    return bool(u and len(u) > 14 and u[14] == "5")
+
+
+def is_qoder_jsonl_file(path: Path) -> bool:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for _ in range(15):
+                line = f.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if isinstance(obj, dict) and (
+                    obj.get("type") in ("active-leaf", "workspace-directories", "runtime-config", "file-history-snapshot")
+                    or "parentUuid" in obj
+                ):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def parse_qoder_jsonl(path: Path) -> Dict[str, Any]:
+    """Parse a Qoder (~/.qoder/projects/<slug>/<uuid>.jsonl) tree along its active leaf.
+
+    Separates Codex-migrated nodes (UUIDv5) from Qoder-native nodes (UUIDv4) so sessions that
+    started in Codex and continued in Qoder can be merged cleanly without duplicate turns.
+    """
+    nodes: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    leaf: Optional[str] = None
+    found_cwd: Optional[str] = None
+    first_ts: Optional[datetime] = None
+    last_ts: datetime = datetime.now(timezone.utc)
+
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            t = obj.get("type")
+            if t == "active-leaf" and obj.get("leafUuid"):
+                leaf = str(obj["leafUuid"])
+            if not found_cwd and obj.get("cwd"):
+                found_cwd = str(obj["cwd"])
+            elif not found_cwd and t == "workspace-directories":
+                dirs = obj.get("directories")
+                if isinstance(dirs, list) and dirs:
+                    found_cwd = str(dirs[0])
+            u = obj.get("uuid")
+            if u and t != "file-history-snapshot":
+                us = str(u)
+                nodes[us] = obj
+                order.append(us)
+
+    if not order:
+        return {
+            "session_id": path.stem.lower(),
+            "cwd": found_cwd or "",
+            "first_ts": None,
+            "last_ts": None,
+            "first_user": "",
+            "migrated_events": [],
+            "native_events": [],
+            "migrated_msg_count": 0,
+            "native_msg_count": 0,
+        }
+
+    if not leaf or leaf not in nodes:
+        leaf = order[-1]
+
+    chain: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    cur: Optional[str] = leaf
+    while cur and cur in nodes and cur not in seen:
+        seen.add(cur)
+        o = nodes[cur]
+        chain.append(o)
+        parent = o.get("parentUuid") or o.get("logicalParentUuid")
+        cur = str(parent) if parent else None
+    chain.reverse()
+
+    newest = order[-1]
+    if newest not in seen:
+        tail: List[Dict[str, Any]] = []
+        cur2: Optional[str] = newest
+        seen2: Set[str] = set()
+        while cur2 and cur2 in nodes and cur2 not in seen and cur2 not in seen2:
+            seen2.add(cur2)
+            o2 = nodes[cur2]
+            tail.append(o2)
+            parent2 = o2.get("parentUuid") or o2.get("logicalParentUuid")
+            cur2 = str(parent2) if parent2 else None
+        if cur2 in seen:
+            idx_join = next(i for i, x in enumerate(chain) if str(x.get("uuid")) == cur2)
+            chain = chain[: idx_join + 1] + list(reversed(tail))
+
+    if len(chain) < 0.3 * len(order):
+        chain = [nodes[u] for u in order]
+
+    mig_events: List[Dict[str, Any]] = []
+    nat_events: List[Dict[str, Any]] = []
+    mig_msgs = 0
+    nat_msgs = 0
+    first_user = ""
+
+    for obj in chain:
+        t = obj.get("type")
+        if obj.get("timestamp"):
+            last_ts = parse_timestamp(obj.get("timestamp"), last_ts)
+            if first_ts is None and t in ("user", "assistant"):
+                first_ts = last_ts
+        if not found_cwd and obj.get("cwd"):
+            found_cwd = str(obj["cwd"])
+
+        is_mig = _is_qoder_migrated_uuid(str(obj.get("uuid") or ""))
+        target_evts = mig_events if is_mig else nat_events
+
+        if t == "system":
+            if obj.get("subtype") == "compact_boundary":
+                meta = obj.get("compactMetadata") if isinstance(obj.get("compactMetadata"), dict) else {}
+                pre_tok = meta.get("preTokens", "?")
+                target_evts.append({"kind": "thinking", "text": f"[Qoder Context Compaction: preTokens={pre_tok}]", "ts": last_ts})
+            continue
+
+        msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+        content = msg.get("content")
+
+        if t == "user":
+            if obj.get("isCompactSummary"):
+                sum_txt = extract_content_parts(content, False)
+                if sum_txt:
+                    nat_events.append(
+                        {"kind": "thinking", "text": "[Qoder Compaction Summary]\n" + truncate_one_line(sum_txt, 1200), "ts": last_ts}
+                    )
+                continue
+            if isinstance(content, list) and any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+                continue
+            if obj.get("isMeta"):
+                continue
+            txt = extract_content_parts(content, True)
+            if txt:
+                if is_mig:
+                    mig_msgs += 1
+                else:
+                    nat_msgs += 1
+                if not first_user:
+                    first_user = txt
+                target_evts.append({"kind": "user", "text": txt, "ts": last_ts})
+        elif t == "assistant":
+            if is_mig:
+                mig_msgs += 1
+            else:
+                nat_msgs += 1
+            if isinstance(content, str) and content.strip():
+                target_evts.append({"kind": "assistant", "text": content.strip(), "ts": last_ts})
+            elif isinstance(content, list):
+                for c in content:
+                    if not isinstance(c, dict):
+                        continue
+                    ct = c.get("type")
+                    if ct == "thinking":
+                        th = str(c.get("thinking") or "").strip()
+                        if th:
+                            target_evts.append({"kind": "thinking", "text": th, "ts": last_ts})
+                    elif ct == "tool_use":
+                        tn = str(c.get("name") or "tool")
+                        inp = c.get("input")
+                        inp_s = json.dumps(inp, ensure_ascii=False) if isinstance(inp, (dict, list)) else str(inp or "")
+                        target_evts.append({"kind": "tool", "text": f"[Tool] {tn}: {truncate_one_line(inp_s, 140)}", "ts": last_ts})
+                    elif ct == "text":
+                        tx = str(c.get("text") or "").strip()
+                        if tx:
+                            target_evts.append({"kind": "assistant", "text": tx, "ts": last_ts})
+
+    return {
+        "session_id": path.stem.lower(),
+        "cwd": found_cwd or "",
+        "first_ts": first_ts,
+        "last_ts": last_ts if (mig_msgs or nat_msgs) else None,
+        "first_user": first_user,
+        "migrated_events": mig_events,
+        "native_events": nat_events,
+        "migrated_msg_count": mig_msgs,
+        "native_msg_count": nat_msgs,
+    }
+
+
 def build_converted_session(
     codex_thread_id: str,
     raw_title: str,
@@ -757,6 +956,8 @@ def build_converted_session(
 
     return {
         "codex_thread_id": tid,
+        "source": "codex",
+        "qoder_session_id": "",
         "agy_conversation_id": agy_conv_id,
         "agy_trajectory_id": agy_traj_id,
         "agy_execution_id": agy_exec_id,
@@ -770,6 +971,7 @@ def build_converted_session(
         "created_at": created_at,
         "updated_at": updated_at,
         "steps": steps,
+        "raw_events": events,
         "user_turns": user_turns,
         "assistant_turns": assistant_turns,
     }
@@ -1071,15 +1273,23 @@ def is_antigravity_running() -> bool:
 # =============================================================================
 def main() -> int:
     default_codex = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+    default_qoder = os.environ.get("QODER_HOME") or str(Path.home() / ".qoder")
     default_agy = str(Path.home() / ".gemini" / "antigravity")
     default_cfg = str(Path.home() / ".gemini" / "config")
 
     parser = argparse.ArgumentParser(
-        description="Convert OpenAI Codex local sessions & projects into Google Antigravity native format."
+        description="Convert OpenAI Codex & Qoder local sessions and projects into Google Antigravity native format."
+    )
+    parser.add_argument(
+        "--source",
+        choices=["auto", "codex", "qoder", "both"],
+        default="auto",
+        help="Session source(s) to import: auto (default: Codex + Qoder if present, merging continued threads), codex, qoder, or both",
     )
     parser.add_argument("--codex-dir", default=default_codex, help="Source Codex directory (default: ~/.codex)")
-    parser.add_argument("--input-jsonl", default="", help="Optional single Codex rollout .jsonl file to convert")
-    parser.add_argument("--thread-id", default="", help="Optional specific Codex thread UUID to convert")
+    parser.add_argument("--qoder-dir", default=default_qoder, help="Source Qoder directory (default: ~/.qoder)")
+    parser.add_argument("--input-jsonl", default="", help="Optional single Codex or Qoder .jsonl file to convert")
+    parser.add_argument("--thread-id", default="", help="Optional specific Codex thread or Qoder session UUID to convert")
     parser.add_argument("--output-dir", default="./dist-agy", help="Staging output directory (default: ./dist-agy)")
     parser.add_argument("--rename-config", default="", help="Optional JSON file overriding project_names / thread_titles")
     parser.add_argument("--title-prefix", default="", help="Optional prefix added to session titles (default: empty)")
@@ -1094,9 +1304,17 @@ def main() -> int:
     args = parser.parse_args()
 
     codex_dir = Path(args.codex_dir).expanduser()
+    qoder_dir = Path(args.qoder_dir).expanduser()
     out_dir = Path(args.output_dir).expanduser().resolve()
     agy_dir = Path(args.antigravity_dir).expanduser()
     cfg_dir = Path(args.gemini_config_dir).expanduser()
+
+    include_codex = args.source in ("auto", "codex", "both") and codex_dir.is_dir()
+    include_qoder = args.source in ("auto", "qoder", "both") and (qoder_dir / "projects").is_dir()
+    if args.source == "codex":
+        include_codex, include_qoder = True, False
+    elif args.source == "qoder":
+        include_codex, include_qoder = False, True
 
     # Load optional rename-config.json
     custom_project_names: Dict[str, str] = {}
@@ -1153,17 +1371,33 @@ def main() -> int:
     skipped_guardian = 0
     skipped_subagent = 0
     skipped_empty = 0
+    skipped_qoder_dup = 0
+    merged_qoder = 0
+    imported_qoder_native = 0
 
     if args.input_jsonl:
         jpath = Path(args.input_jsonl).expanduser().resolve()
-        evts, fid, fcwd, _, _, _ = parse_jsonl_events(jpath)
-        fid = fid or deterministic_uuid_v4("jsonl", str(jpath))
-        ovr = custom_thread_titles.get(fid, "")
-        conv = build_converted_session(
-            fid, ovr, args.title_prefix, fcwd or "", False, "outside-of-project", "", "", None, None, evts
-        )
-        if conv:
-            converted_sessions.append(conv)
+        if is_qoder_jsonl_file(jpath):
+            qinfo = parse_qoder_jsonl(jpath)
+            fid = qinfo["session_id"] or deterministic_uuid_v4("jsonl", str(jpath))
+            ovr = custom_thread_titles.get(fid, "")
+            evts = qinfo["migrated_events"] + qinfo["native_events"]
+            conv = build_converted_session(
+                fid, ovr, args.title_prefix, qinfo["cwd"] or "", False, "outside-of-project", "", "", qinfo["first_ts"], qinfo["last_ts"], evts
+            )
+            if conv:
+                conv["source"] = "qoder"
+                conv["qoder_session_id"] = fid
+                converted_sessions.append(conv)
+        else:
+            evts, fid, fcwd, _, _, _ = parse_jsonl_events(jpath)
+            fid = fid or deterministic_uuid_v4("jsonl", str(jpath))
+            ovr = custom_thread_titles.get(fid, "")
+            conv = build_converted_session(
+                fid, ovr, args.title_prefix, fcwd or "", False, "outside-of-project", "", "", None, None, evts
+            )
+            if conv:
+                converted_sessions.append(conv)
     else:
         index_titles: Dict[str, str] = {}
         index_updated: Dict[str, str] = {}
@@ -1268,6 +1502,25 @@ def main() -> int:
             for rk, cpid, _ in sorted(secondary_roots, key=lambda x: (x[2], -len(x[0]))):
                 if ck == rk or ck.startswith(rk.rstrip("/") + "/"):
                     return codex_projects[cpid]
+            # Fallback to existing Antigravity projects (~/.gemini/config/projects/*.json)
+            raw_uri = path_to_vscode_file_uri(raw_cwd or "")
+            if raw_uri:
+                ul = raw_uri.rstrip("/").lower()
+                for e_uri, e_pid in sorted(existing_uri_to_proj_id.items(), key=lambda kv: len(kv[0]), reverse=True):
+                    if ul == e_uri or ul.startswith(e_uri + "/"):
+                        syn_key = f"agy-existing:{e_pid}"
+                        if syn_key not in codex_projects:
+                            edoc = existing_proj_docs.get(e_pid) or {}
+                            codex_projects[syn_key] = {
+                                "codex_project_id": syn_key,
+                                "agy_project_id": e_pid,
+                                "name": str(edoc.get("name") or Path(clean_fs_path(raw_cwd)).name or "Project"),
+                                "primary_path": clean_fs_path(raw_cwd),
+                                "folder_uri": e_uri,
+                                "folder_exists": True,
+                                "session_count": 0,
+                            }
+                        return codex_projects[syn_key]
             return None
 
         def check_skip(tid: str, sm: Optional[Dict[str, Any]], role: Optional[str], src: Optional[str]) -> Optional[str]:
@@ -1364,7 +1617,7 @@ def main() -> int:
 
         # A. Scan .jsonl files in sessions/ and archived_sessions/, grouping multi-segment rollouts
         jsonl_segments: Dict[str, List[Tuple[int, str, List[Dict[str, Any]], Optional[str], Optional[str], Optional[str], bool]]] = {}
-        for sub in ("sessions", "archived_sessions"):
+        for sub in (("sessions", "archived_sessions") if include_codex else ()):
             sp = codex_dir / sub
             if not sp.is_dir():
                 continue
@@ -1424,7 +1677,7 @@ def main() -> int:
             by_id[fid] = conv
 
         # B. Scan thread_history_*.sqlite (merging segmented rollout IDs and using indexed thread_id lookup)
-        hist_db = find_latest_versioned_sqlite(codex_dir, "thread_history")
+        hist_db = find_latest_versioned_sqlite(codex_dir, "thread_history") if include_codex else None
         if hist_db and hist_db.is_file():
             hconn = open_sqlite_ro(hist_db)
             try:
@@ -1524,6 +1777,138 @@ def main() -> int:
             finally:
                 hconn.close()
 
+        # C. Scan ~/.qoder/projects/*/*.jsonl (merging Codex->Qoder continued threads & importing Qoder-native sessions)
+        if include_qoder and (qoder_dir / "projects").is_dir():
+            def match_qoder_codex_root(qinfo: Dict[str, Any]) -> Optional[str]:
+                if qinfo["migrated_msg_count"] <= 0 or not qinfo["first_ts"]:
+                    return None
+                q_epoch = qinfo["first_ts"].timestamp()
+                q_fu = re.sub(r"\s+", " ", qinfo["first_user"]).strip()
+                q_cwd_k = normalize_lookup_key(qinfo["cwd"])
+                best_match: Optional[Tuple[Tuple[int, int, float], str]] = None
+
+                candidate_ids = set(by_id.keys()) | {segment_to_root.get(k, k) for k in sqlite_meta.keys()}
+                for cid in candidate_ids:
+                    sm = sqlite_meta.get(cid)
+                    c_conv = by_id.get(cid)
+                    c_dt = (
+                        parse_timestamp(sm["created_at"], EPOCH_UTC)
+                        if (sm and sm.get("created_at") is not None)
+                        else (c_conv["created_at"] if c_conv else None)
+                    )
+                    if not c_dt:
+                        continue
+                    gap = abs(c_dt.timestamp() - q_epoch)
+                    c_fu_raw = ""
+                    if sm and sm.get("first_user_message"):
+                        c_fu_raw = clean_user_text(str(sm["first_user_message"]))
+                    elif c_conv and c_conv["steps"]:
+                        c_fu_raw = c_conv["steps"][0]["content"]
+                    c_fu = re.sub(r"\s+", " ", c_fu_raw).strip()
+                    c_cwd_k = normalize_lookup_key((sm.get("cwd") if sm else None) or (c_conv["cwd"] if c_conv else ""))
+
+                    same_cwd = bool(q_cwd_k and c_cwd_k and q_cwd_k == c_cwd_k)
+                    same_text = bool(
+                        len(q_fu) >= 6
+                        and len(c_fu) >= 6
+                        and (q_fu[:36] == c_fu[:36] or q_fu[:28] in c_fu[:120] or c_fu[:28] in q_fu[:120])
+                    )
+                    if (same_text and (same_cwd or gap <= 604800)) or (gap <= 300 and (same_text or same_cwd)):
+                        score = (0 if same_text else 1, 0 if same_cwd else 1, gap)
+                        if best_match is None or score < best_match[0]:
+                            best_match = (score, cid)
+                return best_match[1] if best_match else None
+
+            qoder_files = sorted((qoder_dir / "projects").glob("*/*.jsonl"))
+            for qfile in qoder_files:
+                if not qfile.is_file():
+                    continue
+                qinfo = parse_qoder_jsonl(qfile)
+                qid = qinfo["session_id"]
+                matched_cid = match_qoder_codex_root(qinfo)
+
+                if args.thread_id:
+                    want = args.thread_id.strip().lower()
+                    if qid != want and matched_cid != want:
+                        continue
+
+                # Case 1: Qoder session inherited a Codex thread already staged in by_id
+                if matched_cid and matched_cid in by_id:
+                    if qinfo["native_msg_count"] <= 0:
+                        skipped_qoder_dup += 1
+                        continue
+                    existing = by_id[matched_cid]
+                    if existing.get("source") == "codex":
+                        handoff_ts = qinfo["native_events"][0]["ts"] if qinfo["native_events"] else (qinfo["last_ts"] or existing["updated_at"])
+                        combined_evts = (
+                            list(existing.get("raw_events") or [])
+                            + [{"kind": "thinking", "text": f"[Qoder Session {qid[:8]}] Continued from Codex thread {matched_cid[:8]}", "ts": handoff_ts}]
+                            + qinfo["native_events"]
+                        )
+                        merged_cwd = qinfo["cwd"] or existing["cwd"]
+                        m = resolve_meta(matched_cid, merged_cwd, existing["archived"])
+                        pm = m["proj"]
+                        new_updated = max(existing["updated_at"], qinfo["last_ts"] or existing["updated_at"])
+                        rebuilt = build_converted_session(
+                            matched_cid,
+                            m["title"] or existing["title"],
+                            args.title_prefix,
+                            m["cwd"],
+                            existing["archived"],
+                            pm["agy_project_id"] if pm else existing["agy_project_id"],
+                            pm["name"] if pm else existing["agy_project_name"],
+                            pm["folder_uri"] if pm else existing["workspace_uri"],
+                            existing["created_at"],
+                            new_updated,
+                            combined_evts,
+                        )
+                        if rebuilt:
+                            rebuilt["source"] = "codex+qoder"
+                            rebuilt["qoder_session_id"] = qid
+                            by_id[matched_cid] = rebuilt
+                            merged_qoder += 1
+                        continue
+
+                # Case 2: Pure Qoder native session, or Qoder-only mode (--source qoder), or Codex source no longer in ~/.codex
+                if include_codex and matched_cid and qinfo["native_msg_count"] <= 0:
+                    skipped_qoder_dup += 1
+                    continue
+
+                evts_all = qinfo["migrated_events"] + qinfo["native_events"]
+                if not evts_all:
+                    skipped_empty += 1
+                    continue
+
+                raw_title = custom_thread_titles.get(qid, "")
+                if not raw_title and matched_cid:
+                    m_codex = resolve_meta(matched_cid, qinfo["cwd"], False)
+                    if m_codex["title"]:
+                        raw_title = m_codex["title"] + (" (Qoder)" if matched_cid in by_id else "")
+
+                pm = resolve_project(qid, None, qinfo["cwd"])
+                conv = build_converted_session(
+                    qid,
+                    raw_title,
+                    args.title_prefix,
+                    qinfo["cwd"],
+                    False,
+                    pm["agy_project_id"] if pm else "outside-of-project",
+                    pm["name"] if pm else "",
+                    pm["folder_uri"] if pm else "",
+                    qinfo["first_ts"],
+                    qinfo["last_ts"],
+                    evts_all,
+                )
+                if not conv:
+                    skipped_empty += 1
+                    continue
+                conv["source"] = "codex+qoder" if qinfo["migrated_msg_count"] > 0 else "qoder"
+                conv["qoder_session_id"] = qid
+                if matched_cid and conv["codex_thread_id"] == qid:
+                    conv["origin_codex_thread_id"] = matched_cid
+                by_id[qid] = conv
+                imported_qoder_native += 1
+
         for conv in sorted(by_id.values(), key=lambda x: x["updated_at"], reverse=True):
             converted_sessions.append(conv)
             for pm in codex_projects.values():
@@ -1558,7 +1943,9 @@ def main() -> int:
         write_conversation_files(conv, out_dir)
         manifest.append(
             {
+                "source": conv.get("source", "codex"),
                 "codex_thread_id": conv["codex_thread_id"],
+                "qoder_session_id": conv.get("qoder_session_id", ""),
                 "agy_conversation_id": conv["agy_conversation_id"],
                 "agy_trajectory_id": conv["agy_trajectory_id"],
                 "agy_project_id": conv["agy_project_id"],
@@ -1577,9 +1964,14 @@ def main() -> int:
     upsert_summaries_db(staging_sum_db, converted_sessions)
     (out_dir / "mapping.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    qoder_note = (
+        f", QoderMerged={merged_qoder}, QoderNative={imported_qoder_native}, QoderDupSkipped={skipped_qoder_dup}"
+        if include_qoder
+        else ""
+    )
     print(
         f"[Stage] Converted {len(converted_sessions)} sessions & {len(staged_project_files)} projects -> {out_dir} "
-        f"(Skipped Guardian={skipped_guardian}, Subagent={skipped_subagent}, Empty={skipped_empty})"
+        f"(Skipped Guardian={skipped_guardian}, Subagent={skipped_subagent}, Empty={skipped_empty}{qoder_note})"
     )
 
     if args.verify or args.install:
